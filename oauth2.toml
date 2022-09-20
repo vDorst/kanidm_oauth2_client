@@ -1,0 +1,4 @@
+client_id = ""
+client_secret = ""
+auth_url = "https://kanidm.example.com/ui/oauth2"
+token_url = "https://kanidm.example.com/oauth2/token"
