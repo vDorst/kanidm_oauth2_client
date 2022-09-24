@@ -1,15 +1,15 @@
-#![allow(clippy::deadcode)]
-#![allow(clippy::impofg)]
+#![allow(unused_imports)]
+#![allow(dead_code)]
 
-use actix_web::cookie::Key;
+use actix_identity::{CookieIdentityPolicy, Identity, IdentityService};
+use actix_web::dev::{Service, ServiceRequest, Transform};
 use actix_web::http::{header, Error};
-use actix_web::web::{resource, get};
-use actix_web::{web, App, HttpServer, HttpResponse};
-use std::sync::{Mutex, Arc};
-
-use actix_session::{storage::CookieSessionStore, SessionMiddleware, Session};
-
+use actix_web::web::{get, resource};
+use actix_web::{cookie::Key, dev::Service as _, middleware};
+use actix_web::{web, App, HttpResponse, HttpServer};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 
 use config::Config;
 
@@ -17,24 +17,28 @@ use oauth2::basic::BasicClient;
 use oauth2::reqwest::async_http_client;
 use oauth2::reqwest::http_client;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, RedirectUrl, Scope,
-    TokenResponse, TokenUrl, PkceCodeChallenge, PkceCodeVerifier
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
+
+use async_session::{MemoryStore, Session, SessionStore};
 
 use log::{error, info};
 
-pub fn validate_session(session: &Session) -> Result<(), HttpResponse> {
-    let user_id: Option<bool> = session.get("login").unwrap_or(None);
+use futures_util::future::FutureExt;
 
-    match user_id {
-        Some(true) => {
-            // keep the user's session alive
-            session.renew();
-            Ok(())
-        }
-        Some(_) | None => Err(HttpResponse::Unauthorized().json("Unauthorized")),
-    }
-}
+// pub fn validate_session(session: &Session) -> Result<(), HttpResponse> {
+//     let user_id: Option<bool> = session.get("login").unwrap_or(None);
+
+//     match user_id {
+//         Some(true) => {
+//             // keep the user's session alive
+//             session.renew();
+//             Ok(())
+//         }
+//         Some(_) | None => Err(HttpResponse::Unauthorized().json("Unauthorized")),
+//     }
+// }
 
 struct AppStateWithCounter {
     counter: Mutex<usize>,
@@ -50,15 +54,15 @@ pub struct TokenBody {
 
 struct AppState {
     oauth: BasicClient,
+    store: MemoryStore,
     verify: Mutex<Option<PkceCodeVerifier>>,
 }
 
-
-fn redirect_login(data: &AppState) -> HttpResponse {
+async fn login(data: web::Data<AppState>) -> HttpResponse {
     // Google supports Proof Key for Code Exchange (PKCE - https://oauth.net/2/pkce/).
     // Create a PKCE code verifier and SHA-256 encode it as a code challenge.
     let (pkce_code_challenge, pkce_code_verifier) = PkceCodeChallenge::new_random_sha256();
-    
+
     // Generate the authorization URL to which we'll redirect the user.
     let (authorize_url, csrf_state) = &data
         .oauth
@@ -66,10 +70,10 @@ fn redirect_login(data: &AppState) -> HttpResponse {
         // This example is requesting access to the user's public repos and email.
         .add_scope(Scope::new("openid".to_string()))
         // This is imported to make it work
-        .set_pkce_challenge(pkce_code_challenge)        
+        .set_pkce_challenge(pkce_code_challenge)
         .url();
 
-    info!("Redirect to: {}", authorize_url);
+    info!("Redirect to: {}: {}", authorize_url, csrf_state.secret());
 
     let mut veri = data.verify.lock().unwrap();
 
@@ -80,25 +84,39 @@ fn redirect_login(data: &AppState) -> HttpResponse {
         .finish()
 }
 
-async fn index(session: Session, data: web::Data<AppStateWithCounter>, adata: web::Data<AppState>) -> HttpResponse {
-    match validate_session(&session) {
-        Ok(_) => {
-            let mut counter = data.counter.lock().unwrap(); // <- get counter's MutexGuard
-            *counter += 1; // <- access counter inside MutexGuard
-            
+//async fn index(session: Session, data: web::Data<AppStateWithCounter>, adata: web::Data<AppState>) -> HttpResponse {
+async fn index(id: Identity, data: web::Data<AppStateWithCounter>) -> HttpResponse {
+    let token = match id.identity() {
+        None => {
             let html = format!(
                 r#"<html>
+                    <head><title>OAuth2 Test</title></head>
+                    <body>
+                        <p>You are not login, click <a href=/login>here to login</a></p>
+                    </body>
+                </html>"#
+            );
+            return HttpResponse::Ok().body(html);
+        }
+        Some(token) => token,
+    };
+
+    let mut counter = data.counter.lock().unwrap(); // <- get counter's MutexGuard
+    *counter += 1; // <- access counter inside MutexGuard
+
+    let html = format!(
+        r#"<html>
                 <head><title>OAuth2 Test</title></head>
                 <body>
-                counter {}
+                <p>Logged in <a href=/logout>Logout</a></p>
+                counter {} <br/>
+                Hello {}
                 </body>
-            </html>"#, 
-            counter);
-            
-            HttpResponse::Ok().body(html)
-        },
-        Err(_) => redirect_login(&adata),
-    }
+            </html>"#,
+        counter, token
+    );
+
+    HttpResponse::Ok().body(html)
 }
 
 #[derive(Deserialize)]
@@ -108,8 +126,11 @@ pub struct AuthRequest {
     scope: Option<String>,
 }
 
-async fn auth (
-    session: Session, adata: web::Data<AppState>, params: web::Query<AuthRequest>) -> HttpResponse {
+async fn auth(
+    session: Identity,
+    adata: web::Data<AppState>,
+    params: web::Query<AuthRequest>,
+) -> HttpResponse {
     let code = AuthorizationCode::new(params.code.clone());
     let state = CsrfToken::new(params.state.clone());
     let _scope = params.scope.clone();
@@ -117,13 +138,14 @@ async fn auth (
     let pkce_verifier = adata.verify.lock().unwrap().take().unwrap();
 
     // Exchange the code with a token.
-    let token = adata.oauth.exchange_code(code).set_pkce_verifier(pkce_verifier);
+    let token = adata
+        .oauth
+        .exchange_code(code)
+        .set_pkce_verifier(pkce_verifier);
 
     info!("token: {:?}", token);
 
-    session.insert("login", true).unwrap();
-
-    let token_ret= token.request_async(async_http_client).await;
+    let token_ret = token.request_async(async_http_client).await;
 
     info!("token_ret: {:?}", token_ret);
 
@@ -142,12 +164,26 @@ async fn auth (
         token_ret
     );
 
-     
+    info!("{}", html);
 
-    HttpResponse::Ok().body(html)
+    let access_token = match token_ret {
+        Ok(token) => token.access_token().secret().to_owned(),
+        Err(_) => return HttpResponse::Unauthorized().finish(),
+    };
+
+    session.remember(access_token);
+
+    HttpResponse::Found()
+        .insert_header(("location", "/"))
+        .finish()
 }
 
-
+async fn logout(id: Identity) -> HttpResponse {
+    id.forget();
+    HttpResponse::Found()
+        .insert_header(("location", "/"))
+        .finish()
+}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -159,7 +195,6 @@ async fn main() -> std::io::Result<()> {
         .build()
         .unwrap();
 
-
     // Note: web::Data created _outside_ HttpServer::new closure
     let counter = web::Data::new(AppStateWithCounter {
         counter: Mutex::new(0),
@@ -167,12 +202,10 @@ async fn main() -> std::io::Result<()> {
 
     // Is the `oauth2_rs_name`
     let kanidm_client_id = ClientId::new(oauth2_settings.get("client_id").unwrap());
-    // Is the `oauth2_rs_basic_secret` 
-    let kanidm_client_secret =
-        ClientSecret::new(oauth2_settings.get("client_secret").unwrap());
+    // Is the `oauth2_rs_basic_secret`
+    let kanidm_client_secret = ClientSecret::new(oauth2_settings.get("client_secret").unwrap());
     let kanimd_auth_url = AuthUrl::new(oauth2_settings.get("auth_url").unwrap()).unwrap();
     let kanidm_token_url = TokenUrl::new(oauth2_settings.get("token_url").unwrap()).unwrap();
-        
 
     // Set up the config for the Github OAuth2 process.
     let client = BasicClient::new(
@@ -186,27 +219,35 @@ async fn main() -> std::io::Result<()> {
     .set_redirect_uri(
         RedirectUrl::new("http://localhost:18080/auth".to_string()).expect("Invalid redirect URL"),
     );
-    
-    let appstate = web::Data::new( AppState { oauth: client, verify: Mutex::new(None) } );
 
-    let secret_key = Key::generate();
+    let appstate = web::Data::new(AppState {
+        oauth: client,
+        verify: Mutex::new(None),
+        store: MemoryStore::new(),
+    });
 
-  
-    HttpServer::new(move  || {
+    const COOKIENAME: &str = "COOKIEMAIL";
 
-        let session_mw =
-        SessionMiddleware::builder(CookieSessionStore::default(), secret_key.clone())
-            // disable secure cookie for local testing
-            .cookie_secure(false)
-            .build();
-     
+    // Generate a random 32 byte key. Note that it is important to use a unique
+    // private key for every project. Anyone with access to the key can generate
+    // authentication cookies for any user!
+    let private_key: [u8; 32] = rand::thread_rng().gen();
+
+    HttpServer::new(move || {
         // move counter into the closure
         App::new()
             .app_data(counter.clone()) // <- register the created data
             .app_data(appstate.clone())
-            .wrap(session_mw)
-            .route("/", get().to(index))            
+            .wrap(IdentityService::new(
+                CookieIdentityPolicy::new(&private_key)
+                    .name("MM-AUTH")
+                    .secure(false),
+            ))
+            .wrap(middleware::Logger::default())
+            .route("/", get().to(index))
+            .route("/login", get().to(login))
             .route("/auth", get().to(auth))
+            .route("/logout", get().to(logout))
     })
     .bind(("127.0.0.1", 18080))?
     .run()
