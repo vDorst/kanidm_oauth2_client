@@ -7,9 +7,12 @@ use actix_web::http::{header, Error};
 use actix_web::web::{get, resource};
 use actix_web::{cookie::Key, dev::Service as _, middleware};
 use actix_web::{web, App, HttpResponse, HttpServer};
+use oauth2::http::request;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+
+use std::collections::HashMap;
 
 use config::Config;
 
@@ -18,8 +21,10 @@ use oauth2::reqwest::async_http_client;
 use oauth2::reqwest::http_client;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
+    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl, RevocationUrl, RefreshTokenRequest, RefreshToken,
 };
+
+use reqwest;
 
 use async_session::{MemoryStore, Session, SessionStore};
 
@@ -52,9 +57,15 @@ pub struct TokenBody {
     redirect_uri: String,
 }
 
+#[derive(Clone)]
+struct Account {
+    name: String,
+    email: String,
+}
+
 struct AppState {
     oauth: BasicClient,
-    store: MemoryStore,
+    store: Mutex<HashMap<String, Account>>,
     verify: Mutex<Option<PkceCodeVerifier>>,
 }
 
@@ -85,7 +96,7 @@ async fn login(data: web::Data<AppState>) -> HttpResponse {
 }
 
 //async fn index(session: Session, data: web::Data<AppStateWithCounter>, adata: web::Data<AppState>) -> HttpResponse {
-async fn index(id: Identity, data: web::Data<AppStateWithCounter>) -> HttpResponse {
+async fn index(id: Identity, data: web::Data<AppStateWithCounter>, adata: web::Data<AppState>) -> HttpResponse {
     let token = match id.identity() {
         None => {
             let html = format!(
@@ -104,6 +115,10 @@ async fn index(id: Identity, data: web::Data<AppStateWithCounter>) -> HttpRespon
     let mut counter = data.counter.lock().unwrap(); // <- get counter's MutexGuard
     *counter += 1; // <- access counter inside MutexGuard
 
+    let session_id = id.identity().unwrap();
+
+    let account: Account = adata.store.lock().unwrap().get(&session_id).unwrap().clone();
+
     let html = format!(
         r#"<html>
                 <head><title>OAuth2 Test</title></head>
@@ -113,7 +128,8 @@ async fn index(id: Identity, data: web::Data<AppStateWithCounter>) -> HttpRespon
                 Hello {}
                 </body>
             </html>"#,
-        counter, token
+        counter,
+        account.name,
     );
 
     HttpResponse::Ok().body(html)
@@ -171,6 +187,28 @@ async fn auth(
         Err(_) => return HttpResponse::Unauthorized().finish(),
     };
 
+    let user_info_user = format!("https://idm.vdorst.com/oauth2/openid/{}/userinfo", adata.oauth.client_id().as_str());
+
+    let request = reqwest::Client::new()
+        .get(user_info_user)
+        .bearer_auth(access_token.clone())
+        .send()
+        .await;
+
+    let userinfo_json: serde_json::Value = match request {
+        Ok( data ) => data.json().await.unwrap(),
+        Err( e ) => { error!("userinfo: {:?}", e);
+        return HttpResponse::Unauthorized().finish()},
+    };
+    
+    info!("userinfo: {:#?}", userinfo_json);
+
+    let account = Account {
+        name: userinfo_json.get("name").unwrap().to_string(),
+        email: userinfo_json.get("preferred_username").unwrap().to_string(),
+    };
+
+    adata.store.lock().unwrap().insert(access_token.clone(), account);
     session.remember(access_token);
 
     HttpResponse::Found()
@@ -178,7 +216,12 @@ async fn auth(
         .finish()
 }
 
-async fn logout(id: Identity) -> HttpResponse {
+async fn logout(id: Identity, adata: web::Data<AppState>) -> HttpResponse {
+
+    let session = id.identity().unwrap();
+
+    adata.store.lock().unwrap().remove(&session);
+
     id.forget();
     HttpResponse::Found()
         .insert_header(("location", "/"))
@@ -206,6 +249,8 @@ async fn main() -> std::io::Result<()> {
     let kanidm_client_secret = ClientSecret::new(oauth2_settings.get("client_secret").unwrap());
     let kanimd_auth_url = AuthUrl::new(oauth2_settings.get("auth_url").unwrap()).unwrap();
     let kanidm_token_url = TokenUrl::new(oauth2_settings.get("token_url").unwrap()).unwrap();
+    // Not supported yet: https://github.com/kanidm/kanidm/issues/613
+    //let kanidm_recocation_url = RevocationUrl::new(oauth2_settings.get("revocation_url").unwrap()).unwrap();
 
     // Set up the config for the Github OAuth2 process.
     let client = BasicClient::new(
@@ -214,6 +259,7 @@ async fn main() -> std::io::Result<()> {
         kanimd_auth_url,
         Some(kanidm_token_url),
     )
+    // .set_revocation_uri(kanidm_recocation_url)
     // This example will be running its own server at localhost:18080.
     // See below for the server implementation.
     .set_redirect_uri(
@@ -223,7 +269,7 @@ async fn main() -> std::io::Result<()> {
     let appstate = web::Data::new(AppState {
         oauth: client,
         verify: Mutex::new(None),
-        store: MemoryStore::new(),
+        store: Mutex::new(HashMap::with_capacity(10)),
     });
 
     const COOKIENAME: &str = "COOKIEMAIL";
@@ -233,6 +279,8 @@ async fn main() -> std::io::Result<()> {
     // authentication cookies for any user!
     let private_key: [u8; 32] = rand::thread_rng().gen();
 
+    info!("Server running at http://localhost:18080");
+
     HttpServer::new(move || {
         // move counter into the closure
         App::new()
@@ -240,8 +288,9 @@ async fn main() -> std::io::Result<()> {
             .app_data(appstate.clone())
             .wrap(IdentityService::new(
                 CookieIdentityPolicy::new(&private_key)
-                    .name("MM-AUTH")
-                    .secure(false),
+                    .name("JWT")
+                    .secure(false)
+                    .http_only(true)
             ))
             .wrap(middleware::Logger::default())
             .route("/", get().to(index))
