@@ -57,7 +57,7 @@ pub struct TokenBody {
     redirect_uri: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Account {
     name: String,
     email: String,
@@ -100,12 +100,16 @@ async fn index(id: Identity, data: web::Data<AppStateWithCounter>, adata: web::D
     let token = match id.identity() {
         None => {
             let html = format!(
-                r#"<html>
-                    <head><title>OAuth2 Test</title></head>
-                    <body>
-                        <p>You are not login, click <a href=/login>here to login</a></p>
-                    </body>
-                </html>"#
+    r#"<!DOCTYPE html>
+        <html lang="en-US">
+            <head>
+                <meta charset="utf-8"><html>
+                <title>OAuth2 Test</title>
+            </head>
+            <body>
+                <p>You are not login, click <a href=/login>here to login</a></p>
+            </body>
+        </html>"#
             );
             return HttpResponse::Ok().body(html);
         }
@@ -120,14 +124,18 @@ async fn index(id: Identity, data: web::Data<AppStateWithCounter>, adata: web::D
     let account: Account = adata.store.lock().unwrap().get(&session_id).unwrap().clone();
 
     let html = format!(
-        r#"<html>
-                <head><title>OAuth2 Test</title></head>
-                <body>
+        r#"<!DOCTYPE html>
+        <html lang="en-US">
+            <head>
+                <meta charset="utf-8"><html>
+                <title>OAuth2 Test</title>
+            </head>
+            <body>
                 <p>Logged in <a href=/logout>Logout</a></p>
                 counter {} <br/>
                 Hello {}
-                </body>
-            </html>"#,
+            </body>
+        </html>"#,
         counter,
         account.name,
     );
@@ -207,6 +215,8 @@ async fn auth(
         name: userinfo_json.get("name").unwrap().to_string(),
         email: userinfo_json.get("preferred_username").unwrap().to_string(),
     };
+
+    info!("account: {:?}", account);
 
     adata.store.lock().unwrap().insert(access_token.clone(), account);
     session.remember(access_token);
